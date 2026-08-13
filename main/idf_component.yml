@@ -1,0 +1,6 @@
+version: "1.0.0"
+
+dependencies:
+  idf: ">=5.3,<6.1"
+  espressif/arduino-esp32: "=3.3.10"
+  bblanchon/arduinojson: "=6.21.6"

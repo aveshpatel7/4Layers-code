@@ -1,0 +1,8 @@
+# Use the explicit ESP-IDF app_main() entry point in main/main.cpp.
+# Arduino's own automatic setup()/loop() app_main must stay disabled.
+CONFIG_AUTOSTART_ARDUINO=n
+
+# Custom OTA partition table used by the firmware's HTTP OTA update code.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000

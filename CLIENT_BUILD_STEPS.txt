@@ -1,0 +1,17 @@
+4Layers ESP-IDF Firmware - Quick Build
+
+1. Install VS Code + Espressif ESP-IDF extension.
+2. Open this folder in VS Code.
+3. Open an ESP-IDF terminal.
+4. Run:
+
+   idf.py set-target esp32
+   idf.py build
+
+5. Connect the ESP32 and flash:
+
+   idf.py -p COM3 flash monitor
+
+   Replace COM3 with the actual ESP32 COM port.
+
+No Arduino IDE is required for this project.
