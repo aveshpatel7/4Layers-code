@@ -11,10 +11,10 @@
 
 #define DEBOUNCE_MS 50
 #define PAIRING_TIMEOUT_MS 25000U
-#define PAIRING_CONFIRM_MS 300U 
+#define PAIRING_CONFIRM_MS 1000U 
 #define PAIRING_LED_BLINK_MS 120U
 #define WIFI_STUCK_MS 180000U
-#define SWITCH1_PAIR_TOGGLES 15
+#define SWITCH1_PAIR_TOGGLES 5
 #define SWITCH2_RESET_TOGGLES 20
 
 const char* mqtt_server = "i26a1c71.ala.asia-southeast1.emqxsl.com";
@@ -598,12 +598,6 @@ void system_task(void *arg) {
     static bool reset_triggered = false; 
     static uint32_t last_valid_code = 0; 
     static uint64_t last_valid_rf_time = 0;
-    
-    static uint64_t last_deb_sw1 = 0;
-    static uint64_t last_deb_sw2 = 0;
-    static uint64_t last_deb_sw3 = 0;
-    static uint64_t last_deb_sw4 = 0;
-    static uint64_t last_deb_fan = 0;
 
     Serial.println("⚙️ [SYSTEM] Dual-Core Hardware Task Started on Core 1!");
 
@@ -877,10 +871,10 @@ void system_task(void *arg) {
             }
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int csw1 = digitalRead(switch1);
         
-        if (csw1 != lsw1 && (now_ms - last_deb_sw1 > DEBOUNCE_MS)) {
-            last_deb_sw1 = now_ms;
+        if (csw1 != lsw1) {
             lsw1 = csw1; 
             
             portENTER_CRITICAL(&state_mux); 
@@ -927,10 +921,10 @@ void system_task(void *arg) {
             }
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int csw2 = digitalRead(switch2);
         
-        if (csw2 != lsw2 && (now_ms - last_deb_sw2 > DEBOUNCE_MS)) {
-            last_deb_sw2 = now_ms;
+        if (csw2 != lsw2) {
             lsw2 = csw2; 
             
             portENTER_CRITICAL(&state_mux); 
@@ -978,10 +972,10 @@ void system_task(void *arg) {
             }
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int csw3 = digitalRead(switch3);
         
-        if (csw3 != lsw3 && (now_ms - last_deb_sw3 > DEBOUNCE_MS)) {
-            last_deb_sw3 = now_ms;
+        if (csw3 != lsw3) { 
             lsw3 = csw3; 
             
             portENTER_CRITICAL(&state_mux); 
@@ -1007,10 +1001,10 @@ void system_task(void *arg) {
             schedule_nvs_save(); 
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int csw4 = digitalRead(switch4);
         
-        if (csw4 != lsw4 && (now_ms - last_deb_sw4 > DEBOUNCE_MS)) {
-            last_deb_sw4 = now_ms;
+        if (csw4 != lsw4) { 
             lsw4 = csw4; 
             
             portENTER_CRITICAL(&state_mux); 
@@ -1036,10 +1030,10 @@ void system_task(void *arg) {
             schedule_nvs_save(); 
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int cf_sw = digitalRead(fan_switch);
         
-        if (cf_sw != lfan && (now_ms - last_deb_fan > DEBOUNCE_MS)) {
-            last_deb_fan = now_ms;
+        if (cf_sw != lfan) { 
             lfan = cf_sw; 
             
             if (cf_sw == 0) { 
@@ -1128,7 +1122,7 @@ void system_task(void *arg) {
             reset_triggered = false; 
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10)); 
+        vTaskDelay(pdMS_TO_TICKS(50)); 
     }
 }
 
@@ -1186,7 +1180,7 @@ class DeviceIdWriteCallback: public BLECharacteristicCallbacks {
 void startSetupPortal() {
     inSetupMode = true; 
     char portalSSID[50]; 
-    snprintf(portalSSID, sizeof(portalSSID), "SmartNest-Setup-%s", NODE_ID + 8);
+    snprintf(portalSSID, sizeof(portalSSID), "4Layers-ARQV2.0-%s", NODE_ID + 8);
     
     Serial.printf("⚙️ [SYSTEM] BLE Setup Active! Connect to Bluetooth: %s\n", portalSSID);
 
