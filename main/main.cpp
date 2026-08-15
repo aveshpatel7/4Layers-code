@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -8,13 +10,15 @@
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
+#include <ESPmDNS.h>
+#include <WebServer.h>
 
 #define DEBOUNCE_MS 50
 #define PAIRING_TIMEOUT_MS 25000U
-#define PAIRING_CONFIRM_MS 300U 
+#define PAIRING_CONFIRM_MS 1000U 
 #define PAIRING_LED_BLINK_MS 120U
 #define WIFI_STUCK_MS 180000U
-#define SWITCH1_PAIR_TOGGLES 15
+#define SWITCH1_PAIR_TOGGLES 5
 #define SWITCH2_RESET_TOGGLES 20
 
 const char* mqtt_server = "i26a1c71.ala.asia-southeast1.emqxsl.com";
@@ -29,6 +33,7 @@ char status_topic[100];
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
 Preferences preferences;
+WebServer server(80);
 
 const int relay1 = 15; 
 const int relay2 = 5; 
@@ -453,10 +458,85 @@ void IRAM_ATTR rf_isr() {
     }
 }
 
+// ==========================================
+// NEW FEATURE 1 & 2: Remote Logging & OTA
+// ==========================================
+
+void logRemote(const String& msg) {
+    Serial.println(msg); 
+    if (client.connected()) {
+        char logTopic[120];
+        snprintf(logTopic, sizeof(logTopic), "smartnest/devices/%s/logs", NODE_ID);
+        client.publish(logTopic, msg.c_str());
+    }
+}
+
+void publishOTAStatus(const char* status, int progress) {
+    if (!client.connected()) return;
+    StaticJsonDocument<128> doc;
+    doc["status"] = status;
+    doc["progress"] = progress;
+    
+    char buffer[128];
+    serializeJson(doc, buffer);
+    
+    char ota_status_topic[120];
+    snprintf(ota_status_topic, sizeof(ota_status_topic), "smartnest/devices/%s/ota/status", NODE_ID);
+    client.publish(ota_status_topic, buffer, true);
+    logRemote("[OTA MQTT] Status: " + String(buffer));
+}
+
+void performOTAUpdate(const String& firmwareUrl) {
+    int jitterMs = random(1000, 5000);
+    logRemote("================================================");
+    logRemote("[OTA] Starting Update. Jitter Delay: " + String(jitterMs) + "ms");
+    delay(jitterMs);
+
+    logRemote("[OTA] Target URL: " + firmwareUrl);
+    WiFiClientSecure otaClient;
+    otaClient.setInsecure();
+    otaClient.setTimeout(15000);
+
+    httpUpdate.onProgress([](int cur, int total) {
+        if (total <= 0) return;
+        int percent = (cur * 100) / total;
+        static int lastPercent = -1;
+        if (percent != lastPercent && (percent % 10 == 0 || percent == 100)) {
+            lastPercent = percent;
+            publishOTAStatus("downloading", percent);
+            logRemote("[OTA PROGRESS] Downloaded " + String(percent) + "%");
+        }
+    });
+
+    publishOTAStatus("downloading", 0);
+    t_httpUpdate_return ret = httpUpdate.update(otaClient, firmwareUrl);
+
+    if (ret == HTTP_UPDATE_OK) {
+        logRemote("[OTA SUCCESS] Flashing complete! Rebooting...");
+        publishOTAStatus("success", 100);
+        delay(1000);
+        ESP.restart();
+    } else {
+        logRemote("[OTA ERROR] Failed! Code: " + String(httpUpdate.getLastError()));
+        publishOTAStatus("failed", 0);
+    }
+}
+
+// ==========================================
+
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     StaticJsonDocument<256> doc;
     
     if (deserializeJson(doc, payload, length)) {
+        return;
+    }
+
+    if (doc.containsKey("action") && doc["action"] == "OTA_UPDATE") {
+        const char* url = doc["firmware_url"];
+        if (url && strlen(url) > 0) {
+            logRemote("[MQTT] OTA Update Command Received!");
+            performOTAUpdate(String(url));
+        }
         return;
     }
 
@@ -569,6 +649,116 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     }
 }
 
+void setupLocalWebServer() {
+    server.enableCORS(true);
+
+    server.on("/state", HTTP_GET, []() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        StaticJsonDocument<512> doc;
+        doc["node_id"] = NODE_ID;
+        doc["local_ip"] = WiFi.localIP().toString();
+        
+        portENTER_CRITICAL(&state_mux);
+        doc["channel_1"] = switch_state_ch1 ? "ON" : "OFF";
+        doc["channel_2"] = switch_state_ch2 ? "ON" : "OFF";
+        doc["channel_3"] = switch_state_ch3 ? "ON" : "OFF";
+        doc["channel_4"] = switch_state_ch4 ? "ON" : "OFF";
+        doc["channel_5"] = fan_power ? "ON" : "OFF";
+        doc["speed"] = curr_speed;
+        portEXIT_CRITICAL(&state_mux);
+        
+        String res;
+        serializeJson(doc, res);
+        server.send(200, "application/json", res);
+    });
+
+    server.on("/control", HTTP_GET, []() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        
+        if (!server.hasArg("channel") || !(server.hasArg("state") || server.hasArg("status"))) {
+            server.send(400, "application/json", "{\"error\":\"Missing args\"}");
+            return;
+        }
+        
+        int channel = server.arg("channel").toInt();
+        String stateStr = server.hasArg("state") ? server.arg("state") : server.arg("status");
+        stateStr.toUpperCase();
+        bool turnOn = (stateStr == "ON" || stateStr == "TRUE" || stateStr == "1");
+
+        // YAHAN ERROR FIX KIYA GAYA HAI: (int) lagaya gaya hai
+        if (channel == 5 && server.hasArg("speed")) {
+            Serial.printf("🌐 [APP/LOCAL] Command: Fan Speed -> %d\n", (int)server.arg("speed").toInt());
+        } else {
+            if (turnOn) {
+                Serial.printf("🌐 [APP/LOCAL] Command: Channel %d -> ON\n", channel);
+            } else {
+                Serial.printf("🌐 [APP/LOCAL] Command: Channel %d -> OFF\n", channel);
+            }
+        }
+
+        if (channel == 1) { 
+            portENTER_CRITICAL(&state_mux); 
+            switch_state_ch1 = turnOn; 
+            portEXIT_CRITICAL(&state_mux);
+            digitalWrite(relay1, turnOn ? HIGH : LOW);
+            sendChannelState(1, turnOn); 
+            schedule_nvs_save(); 
+        }
+        else if (channel == 2) { 
+            portENTER_CRITICAL(&state_mux); 
+            switch_state_ch2 = turnOn; 
+            portEXIT_CRITICAL(&state_mux);
+            digitalWrite(relay2, turnOn ? HIGH : LOW);
+            sendChannelState(2, turnOn); 
+            schedule_nvs_save(); 
+        }
+        else if (channel == 3) { 
+            portENTER_CRITICAL(&state_mux); 
+            switch_state_ch3 = turnOn; 
+            portEXIT_CRITICAL(&state_mux);
+            digitalWrite(relay3, turnOn ? HIGH : LOW);
+            sendChannelState(3, turnOn); 
+            schedule_nvs_save(); 
+        }
+        else if (channel == 4) { 
+            portENTER_CRITICAL(&state_mux); 
+            switch_state_ch4 = turnOn; 
+            portEXIT_CRITICAL(&state_mux);
+            digitalWrite(relay4, turnOn ? HIGH : LOW);
+            sendChannelState(4, turnOn); 
+            schedule_nvs_save(); 
+        }
+        else if (channel == 5) { 
+            if (server.hasArg("speed")) {
+                int spd = server.arg("speed").toInt();
+                portENTER_CRITICAL(&state_mux); 
+                pending_fan_speed = spd; 
+                portEXIT_CRITICAL(&state_mux);
+            } else {
+                portENTER_CRITICAL(&state_mux); 
+                if (turnOn) {
+                    pending_fan_speed = fan_speed_memory;
+                } else {
+                    pending_fan_speed = 0;
+                }
+                portEXIT_CRITICAL(&state_mux);
+            }
+        }
+        else if (channel == 6 || channel == 7) {
+            if (turnOn) {
+                All_On();
+            } else {
+                All_Off();
+            }
+        }
+        
+        server.send(200, "application/json", "{\"status\":\"success\"}");
+    });
+
+    server.begin();
+    Serial.println("🌐 [LOCAL] HTTP Server Started on Port 80!");
+}
+
 void system_task(void *arg) {
     int lsw1 = digitalRead(switch1); 
     int lsw2 = digitalRead(switch2);
@@ -598,12 +788,6 @@ void system_task(void *arg) {
     static bool reset_triggered = false; 
     static uint32_t last_valid_code = 0; 
     static uint64_t last_valid_rf_time = 0;
-    
-    static uint64_t last_deb_sw1 = 0;
-    static uint64_t last_deb_sw2 = 0;
-    static uint64_t last_deb_sw3 = 0;
-    static uint64_t last_deb_sw4 = 0;
-    static uint64_t last_deb_fan = 0;
 
     Serial.println("⚙️ [SYSTEM] Dual-Core Hardware Task Started on Core 1!");
 
@@ -877,10 +1061,10 @@ void system_task(void *arg) {
             }
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int csw1 = digitalRead(switch1);
         
-        if (csw1 != lsw1 && (now_ms - last_deb_sw1 > DEBOUNCE_MS)) {
-            last_deb_sw1 = now_ms;
+        if (csw1 != lsw1) {
             lsw1 = csw1; 
             
             portENTER_CRITICAL(&state_mux); 
@@ -927,10 +1111,10 @@ void system_task(void *arg) {
             }
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int csw2 = digitalRead(switch2);
         
-        if (csw2 != lsw2 && (now_ms - last_deb_sw2 > DEBOUNCE_MS)) {
-            last_deb_sw2 = now_ms;
+        if (csw2 != lsw2) {
             lsw2 = csw2; 
             
             portENTER_CRITICAL(&state_mux); 
@@ -978,10 +1162,10 @@ void system_task(void *arg) {
             }
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int csw3 = digitalRead(switch3);
         
-        if (csw3 != lsw3 && (now_ms - last_deb_sw3 > DEBOUNCE_MS)) {
-            last_deb_sw3 = now_ms;
+        if (csw3 != lsw3) { 
             lsw3 = csw3; 
             
             portENTER_CRITICAL(&state_mux); 
@@ -1007,10 +1191,10 @@ void system_task(void *arg) {
             schedule_nvs_save(); 
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int csw4 = digitalRead(switch4);
         
-        if (csw4 != lsw4 && (now_ms - last_deb_sw4 > DEBOUNCE_MS)) {
-            last_deb_sw4 = now_ms;
+        if (csw4 != lsw4) { 
             lsw4 = csw4; 
             
             portENTER_CRITICAL(&state_mux); 
@@ -1036,10 +1220,10 @@ void system_task(void *arg) {
             schedule_nvs_save(); 
         }
 
+        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
         int cf_sw = digitalRead(fan_switch);
         
-        if (cf_sw != lfan && (now_ms - last_deb_fan > DEBOUNCE_MS)) {
-            last_deb_fan = now_ms;
+        if (cf_sw != lfan) { 
             lfan = cf_sw; 
             
             if (cf_sw == 0) { 
@@ -1128,7 +1312,7 @@ void system_task(void *arg) {
             reset_triggered = false; 
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10)); 
+        vTaskDelay(pdMS_TO_TICKS(50)); 
     }
 }
 
@@ -1186,7 +1370,7 @@ class DeviceIdWriteCallback: public BLECharacteristicCallbacks {
 void startSetupPortal() {
     inSetupMode = true; 
     char portalSSID[50]; 
-    snprintf(portalSSID, sizeof(portalSSID), "SmartNest-Setup-%s", NODE_ID + 8);
+    snprintf(portalSSID, sizeof(portalSSID), "4Layers-ARQV2.0-%s", NODE_ID + 8);
     
     Serial.printf("⚙️ [SYSTEM] BLE Setup Active! Connect to Bluetooth: %s\n", portalSSID);
 
@@ -1220,7 +1404,7 @@ void setup() {
     delay(1000);
     
     Serial.println("\n\n===========================================");
-    Serial.println("🚀 4Layers / Go Smart Firmware V12.4 BOOTING");
+    Serial.println("🚀 Go Smart Firmware V12.5 BOOTING");
     Serial.println("===========================================\n");
 
     pinMode(relay1, OUTPUT); 
@@ -1309,7 +1493,13 @@ void setup() {
     snprintf(command_topic, sizeof(command_topic), "home/device/%s/control", NODE_ID);
     snprintf(status_topic, sizeof(status_topic), "home/device/%s/status", NODE_ID);
 
+    Serial.println("\n====================================");
     Serial.printf("📡 Node ID Generated: %s\n", NODE_ID);
+    Serial.println("------------------------------------");
+    Serial.println("🔗 QR Code Links (Click to view):");
+    Serial.printf("Plain ID: https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=%s\n", NODE_ID);
+    Serial.printf("JSON Payload: https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=%%7B%%22uuid%%22:%%22%s%%22%%7D\n", NODE_ID);
+    Serial.println("====================================\n");
     
     xTaskCreatePinnedToCore(system_task, "system_task", 8192, NULL, 5, NULL, 1);
 
@@ -1344,6 +1534,10 @@ void setup() {
 
         if (WiFi.status() == WL_CONNECTED) {
             Serial.println("\n✅ Wi-Fi Connected Instantly!");
+            setupLocalWebServer(); 
+            if (MDNS.begin(NODE_ID)) {
+                Serial.printf("🌐 mDNS Started! Access via: http://%s.local\n", NODE_ID);
+            }
         } else {
             Serial.println("\n⏳ Wi-Fi router offline or booting. ESP will keep trying in background...");
         }
@@ -1370,6 +1564,8 @@ void loop() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
+        server.handleClient(); 
+        
         if (!client.connected()) {
             if (now_ms - last_mqtt_reconnect > 3000 || last_mqtt_reconnect == 0) {
                 last_mqtt_reconnect = now_ms;
@@ -1380,6 +1576,11 @@ void loop() {
                 if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
                     Serial.println("✅ Cloud Connected!");
                     client.subscribe(command_topic);
+                    
+                    char ota_topic_node[120];
+                    snprintf(ota_topic_node, sizeof(ota_topic_node), "smartnest/devices/%s/ota", NODE_ID);
+                    client.subscribe(ota_topic_node);
+                    client.subscribe("smartnest/devices/all/ota");
                     
                     sendChannelState(1, switch_state_ch1); 
                     sendChannelState(2, switch_state_ch2);
