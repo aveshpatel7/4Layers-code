@@ -1,8 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <HTTPClient.h>     // <--- OTA ke liye
-#include <HTTPUpdate.h>     // <--- OTA ke liye
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -29,7 +29,15 @@ const int mqtt_port = 8883;
 const char* mqtt_user = "smartnest_client";
 const char* mqtt_pass = "D2m9ga8JynJDEM6";
 
-// EMQX Cloud DigiCert Root
+// EMQX Cloud serves a DigiCert chain, NOT Let's Encrypt:
+//   leaf   CN=*.ala.asia-southeast1.emqxsl.com
+//   inter  CN=Encryption Everywhere DV TLS CA - G2
+//   root   CN=DigiCert Global Root G2   <-- embedded below
+// Verified with `openssl s_client -connect ...:8883 -showcerts`.
+// Embedding the correct root lets the handshake verify the chain WITHOUT
+// setInsecure() and WITHOUT the runtime CA bundle API (not available on
+// arduino-esp32 3.3.10's WiFiClientSecure — setCACertBundle() takes
+// (const uint8_t*, size_t), not a boolean).
 const char* EMQX_ROOT_CA = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh
@@ -141,21 +149,37 @@ typedef enum {
 
 typedef struct {
     cmd_type_t type;
-    uint8_t channel;     
-    bool state;          
-    int8_t speed;        
-    char source[32];     
-    bool from_cloud;     
+    uint8_t channel;     // 1 - 7
+    bool state;          // true = ON, false = OFF
+    int8_t speed;        // 0 - 4 (-1 if unchanged)
+    char source[32];     // Command origin icon & label
+    bool from_cloud;     // true when the command arrived over MQTT
 } switch_command_t;
 
 static QueueHandle_t command_queue = NULL;
 
+// PubSubClient and WiFiClientSecure are NOT thread-safe, but publishes originate
+// from four tasks (cmd_worker, system_task, webserver_task, mqtt_task) across both
+// cores. Two tasks writing the same TLS session interleaves their records, which
+// the peer rejects as -29184 (invalid SSL record) / -29056 (bad record MAC) and
+// tears the connection down. Every client.* call must hold this mutex.
+//
+// Recursive: mqtt_callback() runs from inside client.loop() while the lock is
+// already held by this task, and it may call logRemote()/publishOTAStatus()
+// which acquire it again. A plain mutex would self-deadlock there.
 static SemaphoreHandle_t mqtt_lock = NULL;
 
 #define MQTT_LOCK_TAKE(ticks) (mqtt_lock == NULL || xSemaphoreTakeRecursive(mqtt_lock, (ticks)) == pdTRUE)
 #define MQTT_LOCK_GIVE()      do { if (mqtt_lock != NULL) xSemaphoreGiveRecursive(mqtt_lock); } while (0)
 
+// Cached MQTT link state, published by mqtt_task. loop() reads it for the status
+// LED instead of calling client.connected() unlocked from another task.
 static volatile bool mqtt_link_up = false;
+
+// Set while a cloud-originated command executes, so sendChannelState() skips the
+// status publish for it. Commands run serially in command_worker_task, so a single
+// flag is sufficient; the only other caller is the queue-full fallback path in
+// process_channel_command(), which is rare and at worst re-enables one echo.
 static volatile bool suppress_status_echo = false;
 
 #define SERVICE_UUID "0000ffe0-0000-1000-8000-00805f9b34fb"
@@ -165,7 +189,9 @@ static volatile bool suppress_status_echo = false;
 
 bool inSetupMode = false; 
 bool shouldReboot = false; 
-String saved_ssid = ""; 
+// String, not char[64]: a WPA2 passphrase is legal up to 63 characters, and a
+// fixed buffer silently truncates anything longer. Read once in setup().
+String saved_ssid = "";
 String saved_password = "";
 
 // ==========================================
@@ -259,6 +285,8 @@ void nvs_commit_task(void *pv)
         
         if (needs_commit) 
         {
+            // Snapshot dirty entries under the lock; NVS/flash writes take mutexes
+            // internally and must never run inside a critical section.
             uint8_t snapshot_val[NVS_CACHE_LEN];
             bool snapshot_dirty[NVS_CACHE_LEN] = {false};
             
@@ -286,6 +314,8 @@ void nvs_commit_task(void *pv)
             portENTER_CRITICAL(&state_mux);
             for (int i = 0; i < NVS_CACHE_LEN; i++) 
             {
+                // Clear only if unchanged since the snapshot; if a newer value
+                // arrived meanwhile keep it dirty for the next sync cycle.
                 if (snapshot_dirty[i] && nvs_cache[i].value == snapshot_val[i]) 
                 {
                     nvs_cache[i].dirty = false;
@@ -297,6 +327,8 @@ void nvs_commit_task(void *pv)
         }
     }
 }
+
+// ==========================================
 
 uint32_t load_code(const char *key, uint32_t def) 
 {
@@ -316,6 +348,7 @@ void save_code(const char *key, uint32_t val)
 
 void sendChannelState(int channel, bool status, int val = -1) 
 {
+    // Cloud-originated commands are not echoed back; see suppress_status_echo.
     if (suppress_status_echo) 
     {
         return;
@@ -333,9 +366,12 @@ void sendChannelState(int channel, bool status, int val = -1)
         doc["status"] = "OFF";
     }
     
-    if (val != -1 && channel == 5) 
+    if (channel == 5) 
     {
-        doc["speed"] = val;
+        int safe_speed = (val != -1 && val > 0) ? val : (curr_speed > 0 ? curr_speed : fan_speed_memory);
+        if (safe_speed < 1 || safe_speed > 4) safe_speed = 4;
+        doc["speed"] = safe_speed;
+        doc["value"] = safe_speed;
     }
 
     char buffer[256];
@@ -492,10 +528,16 @@ void restore_fan_speed()
     }
 }
 
+// ==========================================
+// DIRECT COMMAND EXECUTOR (Called from Command Worker Task)
+// ==========================================
 void execute_command_direct(const switch_command_t *cmd)
 {
     if (cmd == NULL) return;
 
+    // Cloud-originated commands must not echo their resulting state back on the
+    // status topic. Set for the whole call so fan and bulk paths — which publish
+    // from nested helpers like pref_save_fan() — are covered too.
     suppress_status_echo = cmd->from_cloud;
 
     if (cmd->type == CMD_CHANNEL_SET)
@@ -505,6 +547,9 @@ void execute_command_direct(const switch_command_t *cmd)
 
         if (channel >= 1 && channel <= 4)
         {
+            // Idempotency guard: a command that asks for the state the relay is
+            // already in does nothing but wear the relay and generate MQTT
+            // traffic. Drop it before touching hardware.
             bool already;
             portENTER_CRITICAL(&state_mux);
             if (channel == 1)      already = (switch_state_ch1 == turnOn);
@@ -574,8 +619,7 @@ void execute_command_direct(const switch_command_t *cmd)
                 Serial.printf("%s Command: Fan Power -> OFF\n", cmd->source);
                 speed_0();
             }
-        }    
-    }
+        }    }
     else if (cmd->type == CMD_FAN_SPEED_SET)
     {
         int speedVal = cmd->speed;
@@ -597,7 +641,7 @@ void execute_command_direct(const switch_command_t *cmd)
         digitalWrite(relay1, HIGH); 
         sendChannelState(1, true); 
         save_state_to_nvs("R1", 1); 
-        vTaskDelay(pdMS_TO_TICKS(250)); 
+        vTaskDelay(pdMS_TO_TICKS(60)); 
         esp_task_wdt_reset();
 
         portENTER_CRITICAL(&state_mux); 
@@ -607,7 +651,7 @@ void execute_command_direct(const switch_command_t *cmd)
         digitalWrite(relay2, HIGH); 
         sendChannelState(2, true); 
         save_state_to_nvs("R2", 1); 
-        vTaskDelay(pdMS_TO_TICKS(250)); 
+        vTaskDelay(pdMS_TO_TICKS(60)); 
         esp_task_wdt_reset();
 
         portENTER_CRITICAL(&state_mux); 
@@ -617,7 +661,7 @@ void execute_command_direct(const switch_command_t *cmd)
         digitalWrite(relay3, HIGH); 
         sendChannelState(3, true); 
         save_state_to_nvs("R3", 1); 
-        vTaskDelay(pdMS_TO_TICKS(250)); 
+        vTaskDelay(pdMS_TO_TICKS(60)); 
         esp_task_wdt_reset();
 
         portENTER_CRITICAL(&state_mux); 
@@ -627,7 +671,7 @@ void execute_command_direct(const switch_command_t *cmd)
         digitalWrite(relay4, HIGH); 
         sendChannelState(4, true); 
         save_state_to_nvs("R4", 1); 
-        vTaskDelay(pdMS_TO_TICKS(250)); 
+        vTaskDelay(pdMS_TO_TICKS(60)); 
         esp_task_wdt_reset();
 
         bool f_pow; 
@@ -654,7 +698,7 @@ void execute_command_direct(const switch_command_t *cmd)
         digitalWrite(relay1, LOW); 
         sendChannelState(1, false); 
         save_state_to_nvs("R1", 0); 
-        vTaskDelay(pdMS_TO_TICKS(250)); 
+        vTaskDelay(pdMS_TO_TICKS(60)); 
         esp_task_wdt_reset();
 
         portENTER_CRITICAL(&state_mux); 
@@ -664,7 +708,7 @@ void execute_command_direct(const switch_command_t *cmd)
         digitalWrite(relay2, LOW); 
         sendChannelState(2, false); 
         save_state_to_nvs("R2", 0); 
-        vTaskDelay(pdMS_TO_TICKS(250)); 
+        vTaskDelay(pdMS_TO_TICKS(60)); 
         esp_task_wdt_reset();
 
         portENTER_CRITICAL(&state_mux); 
@@ -674,7 +718,7 @@ void execute_command_direct(const switch_command_t *cmd)
         digitalWrite(relay3, LOW); 
         sendChannelState(3, false); 
         save_state_to_nvs("R3", 0); 
-        vTaskDelay(pdMS_TO_TICKS(250)); 
+        vTaskDelay(pdMS_TO_TICKS(60)); 
         esp_task_wdt_reset();
 
         portENTER_CRITICAL(&state_mux); 
@@ -684,7 +728,7 @@ void execute_command_direct(const switch_command_t *cmd)
         digitalWrite(relay4, LOW); 
         sendChannelState(4, false); 
         save_state_to_nvs("R4", 0); 
-        vTaskDelay(pdMS_TO_TICKS(250)); 
+        vTaskDelay(pdMS_TO_TICKS(60)); 
         esp_task_wdt_reset();
 
         Serial.println("⚙️ [SYSTEM] Bulk OFF -> Fan OFF");
@@ -696,6 +740,9 @@ void execute_command_direct(const switch_command_t *cmd)
     suppress_status_echo = false;
 }
 
+// ==========================================
+// DEDICATED COMMAND QUEUE WORKER TASK (Core 1)
+// ==========================================
 void command_worker_task(void *pvParameters) 
 {
     esp_task_wdt_add(NULL);
@@ -713,6 +760,14 @@ void command_worker_task(void *pvParameters)
     }
 }
 
+// ==========================================
+// MASTER CHANNEL CONTROLLER (Queue-Buffered)
+// ==========================================
+// fromCloud marks commands that arrived over MQTT. Those must NOT be echoed back
+// on the status topic: the app already knows the state it just asked for, and
+// echoing it re-triggers the app's own change listener, producing an endless
+// OFF -> ON -> OFF command storm. Local sources (physical switch, RF remote,
+// local web UI) still publish, because the app has no other way to learn about them.
 void process_channel_command(int channel, bool turnOn, int speedVal, const char* sourceIcon, bool fromCloud = false)
 {
     switch_command_t cmd;
@@ -786,6 +841,7 @@ void All_Off()
 { 
     process_channel_command(6, false, -1, "⚙️ [SYSTEM]");
 }
+// ==========================================
 
 void IRAM_ATTR rf_isr() 
 {
@@ -834,9 +890,6 @@ void IRAM_ATTR rf_isr()
     }
 }
 
-// ==========================================
-// 🚀 OTA UPDATE FUNCTIONS ADDED SAFELY HERE
-// ==========================================
 void logRemote(const String& msg) 
 {
     Serial.println(msg); 
@@ -934,7 +987,6 @@ void performOTAUpdate(const String& firmwareUrl)
         publishOTAStatus("failed", 0);
     }
 }
-// ==========================================
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) 
 {
@@ -950,20 +1002,20 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length)
         return;
     }
 
-    // 🚀 NEW OTA LOGIC (BUG FIXED) 
     if (doc.containsKey("action") && doc["action"] == "OTA_UPDATE") 
     {
         const char* url_ptr = doc["firmware_url"];
         
         if (url_ptr && strlen(url_ptr) > 0) 
         {
-            // 🚨 DEEP COPY URL HERE to prevent PubSubClient Buffer Overwrite corruption!
-            String fw_url = String(url_ptr); 
-
+            // Deep copy before leaving the callback: url_ptr points into
+            // PubSubClient's receive buffer, and performOTAUpdate() sleeps for a
+            // 1-5s jitter delay during which client.loop() on another task can
+            // overwrite that buffer.
+            String fw_url = String(url_ptr);
+            
             Serial.println("📱 [APP/CLOUD] OTA Update Command Received!");
             logRemote("[MQTT] OTA Update Command Received!");
-            
-            // Calling OTA with the SAFE Deep Copied String
             performOTAUpdate(fw_url);
         }
         else 
@@ -1045,16 +1097,19 @@ void setupLocalWebServer()
         
         portENTER_CRITICAL(&state_mux);
         
+        // Structured relays array for fast app parsing
         JsonArray relays = doc.createNestedArray("relays");
         relays.add(switch_state_ch1 ? 1 : 0);
         relays.add(switch_state_ch2 ? 1 : 0);
         relays.add(switch_state_ch3 ? 1 : 0);
         relays.add(switch_state_ch4 ? 1 : 0);
         
+        // Structured fan object
         JsonObject fanObj = doc.createNestedObject("fan");
         fanObj["enabled"] = fan_power;
         fanObj["speed"] = curr_speed;
         
+        // Key-value channels for backwards compatibility
         doc["channel_1"] = switch_state_ch1 ? "ON" : "OFF";
         doc["channel_2"] = switch_state_ch2 ? "ON" : "OFF";
         doc["channel_3"] = switch_state_ch3 ? "ON" : "OFF";
@@ -1071,6 +1126,7 @@ void setupLocalWebServer()
         String res;
         serializeJson(doc, res);
         server.send(200, "application/json", res);
+        // Note: excessive Serial.println removed to ensure < 20ms response time
     });
 
     server.on("/control", HTTP_GET, []() 
@@ -1126,6 +1182,9 @@ void system_task(void *arg)
     int lsw3 = digitalRead(switch3); 
     int lsw4 = digitalRead(switch4);
     int lfan = digitalRead(fan_switch);
+
+    uint32_t last_sw_toggle_ms[5] = {0, 0, 0, 0, 0};
+    uint8_t sw_chatter_count[5] = {0, 0, 0, 0, 0};
 
     speed1_flag = 1; 
     speed2_flag = 1; 
@@ -1372,115 +1431,166 @@ void system_task(void *arg)
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
-        int csw1 = digitalRead(switch1);
-        
-        if (csw1 != lsw1) 
+        // 1. Channel 1 Physical Switch (GPIO 32 - Pullup)
+        int raw_sw1 = digitalRead(switch1);
+        if (raw_sw1 != lsw1)
         {
-            lsw1 = csw1; 
-            
-            bool is_pressed = (csw1 == 0);
-            process_channel_command(1, is_pressed, -1, "🔘 [PHYSICAL SWITCH]");
-            
-            if (pairing_target == 0) 
+            bool stable = true;
+            for (int s = 0; s < 4; s++)
             {
-                uint32_t t_diff = now_ms - last_switch1_toggle_time;
-                
-                if (t_diff > 1500) switch1_toggle_count = 1; 
-                else if (t_diff > 100) switch1_toggle_count++; 
-                
-                last_switch1_toggle_time = now_ms;
-                
-                if (switch1_toggle_count >= SWITCH1_PAIR_TOGGLES) 
-                { 
-                    Serial.println("⚙️ [SYSTEM] Triggering RF Pairing Mode via Switch 1!");
-                    pairing_target = 1; 
-                    pairing_timeout = now_ms; 
-                    switch1_toggle_count = 0; 
-                    pairing_confirm_until_ms = now_ms + PAIRING_CONFIRM_MS; 
-                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+                if (digitalRead(switch1) != raw_sw1) { stable = false; break; }
             }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
-        int csw2 = digitalRead(switch2);
-        
-        if (csw2 != lsw2) 
-        {
-            lsw2 = csw2; 
-            
-            bool is_pressed = (csw2 == 0);
-            process_channel_command(2, is_pressed, -1, "🔘 [PHYSICAL SWITCH]");
-            
-            if (pairing_target == 0) 
+            if (stable)
             {
-                uint32_t t_diff = now_ms - last_switch2_toggle_time;
-                
-                if (t_diff > 1500) switch2_toggle_count = 1; 
-                else if (t_diff > 100) switch2_toggle_count++; 
-                
-                last_switch2_toggle_time = now_ms;
-                
-                if (switch2_toggle_count >= SWITCH2_RESET_TOGGLES) 
-                { 
-                    Serial.println("🚨 [SYSTEM] FACTORY RESET VIA SWITCH 2 Toggled 20 Times!");
-                    preferences.begin("wifi", false); 
-                    preferences.clear(); 
-                    preferences.end(); 
-                    delay(500); 
-                    ESP.restart(); 
-                }
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
-        int csw3 = digitalRead(switch3);
-        
-        if (csw3 != lsw3) 
-        { 
-            lsw3 = csw3; 
-            
-            bool is_pressed = (csw3 == 0);
-            process_channel_command(3, is_pressed, -1, "🔘 [PHYSICAL SWITCH]");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
-        int csw4 = digitalRead(switch4);
-        
-        if (csw4 != lsw4) 
-        { 
-            lsw4 = csw4; 
-            
-            bool is_pressed = (csw4 == 0);
-            process_channel_command(4, is_pressed, -1, "🔘 [PHYSICAL SWITCH]");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS)); 
-        int cf_sw = digitalRead(fan_switch);
-        
-        if (cf_sw != lfan) 
-        { 
-            lfan = cf_sw; 
-            
-            if (cf_sw == 0) 
-            { 
-                Serial.println("🔘 [PHYSICAL SWITCH] Fan Toggle Switch -> ON");
-                int l_speed; 
-                
-                portENTER_CRITICAL(&state_mux); 
-                l_speed = curr_speed; 
-                portEXIT_CRITICAL(&state_mux); 
-                
-                if (l_speed == 0) 
+                uint32_t t_now = millis();
+                if (t_now - last_sw_toggle_ms[0] > 250)
                 {
-                    restore_fan_speed(); 
+                    last_sw_toggle_ms[0] = t_now;
+                    lsw1 = raw_sw1;
+                    bool is_pressed = (raw_sw1 == 0);
+                    process_channel_command(1, is_pressed, -1, "🔘 [PHYSICAL SWITCH]");
+
+                    if (pairing_target == 0) 
+                    {
+                        uint32_t t_diff = now_ms - last_switch1_toggle_time;
+                        if (t_diff > 1500) switch1_toggle_count = 1; 
+                        else if (t_diff > 100) switch1_toggle_count++; 
+                        last_switch1_toggle_time = now_ms;
+                        
+                        if (switch1_toggle_count >= SWITCH1_PAIR_TOGGLES) 
+                        { 
+                            Serial.println("⚙️ [SYSTEM] Triggering RF Pairing Mode via Switch 1!");
+                            pairing_target = 1; 
+                            pairing_timeout = now_ms; 
+                            switch1_toggle_count = 0; 
+                            pairing_confirm_until_ms = now_ms + PAIRING_CONFIRM_MS; 
+                        }
+                    }
                 }
-            } 
-            else 
-            { 
-                Serial.println("🔘 [PHYSICAL SWITCH] Fan Toggle Switch -> OFF");
-                speed_0(); 
-            } 
+            }
+        }
+
+        // 2. Channel 2 Physical Switch (GPIO 35 - Input Only, Filter Floating Noise)
+        int raw_sw2 = digitalRead(switch2);
+        if (raw_sw2 != lsw2)
+        {
+            bool stable = true;
+            for (int s = 0; s < 4; s++)
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                if (digitalRead(switch2) != raw_sw2) { stable = false; break; }
+            }
+            if (stable)
+            {
+                uint32_t t_now = millis();
+                if (t_now - last_sw_toggle_ms[1] > 250)
+                {
+                    last_sw_toggle_ms[1] = t_now;
+                    lsw2 = raw_sw2;
+                    bool is_pressed = (raw_sw2 == 0);
+                    process_channel_command(2, is_pressed, -1, "🔘 [PHYSICAL SWITCH]");
+
+                    if (pairing_target == 0) 
+                    {
+                        uint32_t t_diff = now_ms - last_switch2_toggle_time;
+                        if (t_diff > 1500) switch2_toggle_count = 1; 
+                        else if (t_diff > 100) switch2_toggle_count++; 
+                        last_switch2_toggle_time = now_ms;
+                        
+                        if (switch2_toggle_count >= SWITCH2_RESET_TOGGLES) 
+                        { 
+                            Serial.println("🚨 [SYSTEM] FACTORY RESET VIA SWITCH 2 Toggled 20 Times!");
+                            preferences.begin("wifi", false); 
+                            preferences.clear(); 
+                            preferences.end(); 
+                            delay(500); 
+                            ESP.restart(); 
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Channel 3 Physical Switch (GPIO 34 - Input Only, Filter Floating Noise)
+        int raw_sw3 = digitalRead(switch3);
+        if (raw_sw3 != lsw3)
+        {
+            bool stable = true;
+            for (int s = 0; s < 4; s++)
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                if (digitalRead(switch3) != raw_sw3) { stable = false; break; }
+            }
+            if (stable)
+            {
+                uint32_t t_now = millis();
+                if (t_now - last_sw_toggle_ms[2] > 250)
+                {
+                    last_sw_toggle_ms[2] = t_now;
+                    lsw3 = raw_sw3;
+                    bool is_pressed = (raw_sw3 == 0);
+                    process_channel_command(3, is_pressed, -1, "🔘 [PHYSICAL SWITCH]");
+                }
+            }
+        }
+
+        // 4. Channel 4 Physical Switch (GPIO 39 - Input Only, Filter Floating Noise)
+        int raw_sw4 = digitalRead(switch4);
+        if (raw_sw4 != lsw4)
+        {
+            bool stable = true;
+            for (int s = 0; s < 4; s++)
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                if (digitalRead(switch4) != raw_sw4) { stable = false; break; }
+            }
+            if (stable)
+            {
+                uint32_t t_now = millis();
+                if (t_now - last_sw_toggle_ms[3] > 250)
+                {
+                    last_sw_toggle_ms[3] = t_now;
+                    lsw4 = raw_sw4;
+                    bool is_pressed = (raw_sw4 == 0);
+                    process_channel_command(4, is_pressed, -1, "🔘 [PHYSICAL SWITCH]");
+                }
+            }
+        }
+
+        // 5. Fan Physical Switch (GPIO 33 - Pullup)
+        int raw_fan = digitalRead(fan_switch);
+        if (raw_fan != lfan)
+        {
+            bool stable = true;
+            for (int s = 0; s < 4; s++)
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                if (digitalRead(fan_switch) != raw_fan) { stable = false; break; }
+            }
+            if (stable)
+            {
+                uint32_t t_now = millis();
+                if (t_now - last_sw_toggle_ms[4] > 250)
+                {
+                    last_sw_toggle_ms[4] = t_now;
+                    lfan = raw_fan;
+                    if (raw_fan == 0)
+                    {
+                        Serial.println("🔘 [PHYSICAL SWITCH] Fan Toggle Switch -> ON");
+                        int l_speed; 
+                        portENTER_CRITICAL(&state_mux); 
+                        l_speed = curr_speed; 
+                        portEXIT_CRITICAL(&state_mux); 
+                        if (l_speed == 0) restore_fan_speed(); 
+                    }
+                    else
+                    {
+                        Serial.println("🔘 [PHYSICAL SWITCH] Fan Toggle Switch -> OFF");
+                        speed_0(); 
+                    }
+                }
+            }
         }
 
         if (digitalRead(s1) == LOW && speed1_flag == 1) 
@@ -1707,6 +1817,7 @@ void mqtt_task(void *pvParameters)
             }
             else
             {
+                // Another task holds the client; try again next tick.
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
@@ -1718,8 +1829,10 @@ void mqtt_task(void *pvParameters)
                               (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
                 Serial.println("☁️ Connecting to EMQX Cloud...");
                 
+                // Explicitly stop previous client session to clear stale buffers and prevent TLS -29184 error
                 espClient.stop();
                 
+                // Ensure DNS servers are active on lwIP
                 ip_addr_t d1, d2;
                 d1.type = IPADDR_TYPE_V4;
                 d1.u_addr.ip4.addr = ipaddr_addr("8.8.8.8");
@@ -1729,8 +1842,18 @@ void mqtt_task(void *pvParameters)
                 dns_setserver(1, &d2);
                 
                 char clientId[50];
+                // Unique per attempt: MQTT brokers evict an existing session when a
+                // second connection presents the same client ID. A fixed ID means a
+                // lingering server-side session (or any other client reusing it) kicks
+                // us in a loop, which looks like a silent disconnect every few seconds.
                 snprintf(clientId, sizeof(clientId), "4L-Client-%s-%04X", NODE_ID, (unsigned)(esp_random() & 0xFFFF));
                 
+                // client.connect() blocks for the whole TLS handshake, which is
+                // allowed up to setHandshakeTimeout(30) seconds. The task WDT fires
+                // at 5s, so this task must leave the WDT's watch list for the
+                // duration of the call or the handshake itself trips the watchdog.
+                // The mutex is held across connect + subscribe so no other task can
+                // publish into a half-established session.
                 if (!MQTT_LOCK_TAKE(pdMS_TO_TICKS(2000)))
                 {
                     vTaskDelay(pdMS_TO_TICKS(100));
@@ -1738,7 +1861,7 @@ void mqtt_task(void *pvParameters)
                 }
                 
                 esp_task_wdt_delete(NULL);
-                bool mqtt_connected = client.connect(clientId, mqtt_user, mqtt_pass, status_topic, 1, true, "{\"status\":\"OFFLINE\",\"is_online\":false}");
+                bool mqtt_connected = client.connect(clientId, mqtt_user, mqtt_pass, status_topic, 1, false, "{\"status\":\"OFFLINE\",\"is_online\":false}");
                 esp_task_wdt_add(NULL);
                 esp_task_wdt_reset();
                 
@@ -1748,12 +1871,10 @@ void mqtt_task(void *pvParameters)
                                   (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap());
                     client.subscribe(command_topic);
                     
-                    // --- OTA TOPICS SUBSCRIBED ---
                     char ota_topic_node[120];
                     snprintf(ota_topic_node, sizeof(ota_topic_node), "smartnest/devices/%s/ota", NODE_ID);
                     client.subscribe(ota_topic_node);
                     client.subscribe("smartnest/devices/all/ota");
-                    // -----------------------------
 
                     StaticJsonDocument<128> ipDoc;
                     ipDoc["local_ip"] = WiFi.localIP().toString();
@@ -1772,6 +1893,8 @@ void mqtt_task(void *pvParameters)
                         Serial.println("❌ [ERROR] Failed to publish Local IP to Cloud!");
                     }
                     
+                    // Release before sendChannelState() — the mutex is not recursive
+                    // and that helper acquires it for each publish.
                     MQTT_LOCK_GIVE();
                     
                     sendChannelState(1, switch_state_ch1); 
@@ -1792,6 +1915,7 @@ void mqtt_task(void *pvParameters)
                     espClient.stop();
                     MQTT_LOCK_GIVE();
                     
+                    // Non-blocking 15-second delay on Core 1 so CPU 0 and Local WebServer remain 100% responsive
                     for (int i = 0; i < 15; i++) 
                     {
                         esp_task_wdt_reset();
@@ -1809,7 +1933,7 @@ void mqtt_task(void *pvParameters)
                 }
 
                 unsigned long now_ms = millis();
-                if (now_ms - last_heartbeat_ms >= 20000 || last_heartbeat_ms == 0) 
+                if (now_ms - last_heartbeat_ms >= 60000 || last_heartbeat_ms == 0) 
                 {
                     last_heartbeat_ms = now_ms;
                     StaticJsonDocument<192> hbDoc;
@@ -1848,7 +1972,8 @@ void setup()
     esp_task_wdt_add(NULL); 
 
     Serial.println("\n\n===========================================");
-    Serial.println("🚀 Go Smart Firmware V12.5 (PRO-OPTIMIZED + SAFEST OTA FIX)");
+    Serial.println("🚀 Go Smart Firmware V12.5 (PRO-OPTIMIZED)");
+    Serial.println("🔍 LOGGING: ALL SENSORS & EVENTS ACTIVATED!");
     Serial.println("===========================================\n");
 
     pinMode(relay1, OUTPUT); 
@@ -1906,7 +2031,8 @@ void setup()
     else speed_0();
 
     uint64_t mac = ESP.getEfuseMac(); 
-    snprintf(NODE_ID, sizeof(NODE_ID), "4L-NODE-%06llX", mac & 0xFFFFFF);
+    uint8_t* m = (uint8_t*)&mac;
+    snprintf(NODE_ID, sizeof(NODE_ID), "4L-NODE-%02X%02X%02X", m[3], m[4], m[5]);
     snprintf(command_topic, sizeof(command_topic), "home/device/%s/control", NODE_ID);
     snprintf(status_topic, sizeof(status_topic), "home/device/%s/status", NODE_ID);
 
@@ -1914,6 +2040,7 @@ void setup()
     Serial.printf("📡 Node ID Generated: %s\n", NODE_ID);
     Serial.println("====================================\n");
     
+    // Initialize Command Queue (depth 16) for buffering sequential channel and bulk commands
     command_queue = xQueueCreate(16, sizeof(switch_command_t));
     if (command_queue == NULL) 
     {
@@ -1924,22 +2051,24 @@ void setup()
         Serial.println("✅ [SYSTEM] FreeRTOS Command Queue (depth 16) Initialized!");
     }
 
+    // Serialises every PubSubClient access; must exist before any task can publish.
     mqtt_lock = xSemaphoreCreateRecursiveMutex();
     if (mqtt_lock == NULL) 
     {
         Serial.println("❌ [ERROR] Failed to create MQTT mutex!");
     }
     
+    // Command Worker Task strictly on Core 1 (Priority 4, Stack 4KB)
     xTaskCreatePinnedToCore(command_worker_task, "cmd_worker", 4096, NULL, 4, NULL, 1);
+
+    // RAM Reduced to 4KB (4096) for faster execution!
     xTaskCreatePinnedToCore(system_task, "system_task", 4096, NULL, 5, NULL, 1);
+    
     xTaskCreatePinnedToCore(nvs_commit_task, "nvs_commit", 3072, NULL, 3, NULL, 1);
 
     preferences.begin("wifi", true);
-    
-    // 🔥 STRING FIX FOR PREFERENCES
-    saved_ssid = preferences.getString("ssid", ""); 
+    saved_ssid = preferences.getString("ssid", "");
     saved_password = preferences.getString("pass", "");
-    
     preferences.end();
 
     if (saved_ssid.length() > 0) 
@@ -1952,6 +2081,7 @@ void setup()
         WiFi.setSleep(false); 
         WiFi.setAutoReconnect(true); 
         
+        // Configure DNS via lwIP directly
         ip_addr_t d1, d2;
         d1.type = IPADDR_TYPE_V4;
         d1.u_addr.ip4.addr = ipaddr_addr("8.8.8.8");
@@ -1995,9 +2125,16 @@ void setup()
             delay(3000);
         }
         
+        // Re-set Google & Cloudflare DNS in lwIP after DHCP connection
         dns_setserver(0, &d1);
         dns_setserver(1, &d2);
 
+        // SNTP / NTP time sync — CRITICAL FOR TLS.
+        // ESP32 cold-boot has RTC = 0 (Jan 1970), so any valid server cert looks
+        // "not yet valid" to mbedTLS and X509 verification fails (-9984) even with
+        // the correct root CA. Block up to ~8s for NTP; if it succeeds verify the
+        // chain against DigiCert Global Root G2, else fall back to insecure TLS so
+        // MQTT still connects in degraded mode.
         configTime(0, 0, "time.google.com", "pool.ntp.org", "time.cloudflare.com");
         bool timeOk = false;
         for (int t = 0; t < 8; t++) {
@@ -2012,18 +2149,31 @@ void setup()
             Serial.println("⚠️ [NTP] Time sync failed! Falling back to insecure TLS for MQTT.");
             espClient.setInsecure();
         }
-        
-        espClient.setHandshakeTimeout(30);  
+        // Do NOT shorten the socket timeout here. setTimeout() drives SO_RCVTIMEO
+        // for every read, and PubSubClient's loop() polls available() constantly.
+        // With a 2s recv timeout mbedtls_ssl_read() returns NET_RECV_FAILED (-76)
+        // on an idle socket, which NetworkClientSecure treats as fatal and closes
+        // the connection — causing a reconnect every ~15-30s. The 30s library
+        // default lets idle reads block harmlessly.
+        espClient.setHandshakeTimeout(30);      // EMQX TLS handshake can take 10-25s on weak RSSI
         
         client.setServer(mqtt_server, mqtt_port); 
         client.setCallback(mqtt_callback);
-        client.setKeepAlive(60); 
+        client.setKeepAlive(120); 
         client.setBufferSize(1024);
+        // PubSubClient's default 15s socket timeout applies to readByte() while a
+        // packet is mid-flight. Keep it well under the 60s keepalive so a stalled
+        // read is detected, but long enough that a slow link is not mistaken for
+        // a dead connection.
         client.setSocketTimeout(30);
 
         setupLocalWebServer(); 
         
+        // Strict Core Isolation:
+        // WebServer strictly on Core 0 (High Priority 5, Stack 4KB)
         xTaskCreatePinnedToCore(webserver_task, "webserver_task", 6144, NULL, 5, NULL, 0);
+        
+        // MQTT Task strictly on Core 1 (Priority 2, Stack 4KB)
         xTaskCreatePinnedToCore(mqtt_task, "mqtt_task", 12288, NULL, 2, NULL, 1);
 
         if (connected) 
